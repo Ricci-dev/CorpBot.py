@@ -1,1228 +1,945 @@
 import asyncio
+import sys
+from datetime import datetime, timedelta
+
 import discord
-import datetime
-import time
-import random
-from   discord.ext import commands
-from   operator import itemgetter
-from   Cogs import Settings
-from   Cogs import DisplayName
-from   Cogs import Nullify
-from   Cogs import CheckRoles
-from   Cogs import UserTime
-
-def setup(bot):
-	# Add the bot and deps
-	settings = bot.get_cog("Settings")
-	bot.add_cog(Xp(bot, settings))
-
-# This is the xp module.  It's likely to be retarded.
-
-class Xp(commands.Cog):
-
-	# Init with the bot reference, and a reference to the settings var
-	def __init__(self, bot, settings):
-		self.bot = bot
-		self.settings = settings
-		self.is_current = False # Used for stopping loops
-		global Utils, DisplayName
-		Utils = self.bot.get_cog("Utils")
-		DisplayName = self.bot.get_cog("DisplayName")
-
-	def _can_xp(self, user, server, requiredXP = None, promoArray = None):
-		# Checks whether or not said user has access to the xp system
-		if requiredXP == None:
-			requiredXP = self.settings.getServerStat(server, "RequiredXPRole", None)
-		if promoArray == None:
-			promoArray = self.settings.getServerStat(server, "PromotionArray", [])
-
-		if not requiredXP:
-			return True
-
-		for checkRole in user.roles:
-			if str(checkRole.id) == str(requiredXP):
-				return True
-				
-		# Still check if we have enough xp
-		userXP = self.settings.getUserStat(user, server, "XP")
-		for role in promoArray:
-			if str(role["ID"]) == str(requiredXP):
-				if userXP >= role["XP"]:
-					return True
-				break
-		return False
-
-	# Proof of concept stuff for reloading cog/extension
-	def _is_submodule(self, parent, child):
-		return parent == child or child.startswith(parent + ".")
-
-	@commands.Cog.listener()
-	async def on_unloaded_extension(self, ext):
-		# Called to shut things down
-		if not self._is_submodule(ext.__name__, self.__module__):
-			return
-		self.is_current = False
-
-	@commands.Cog.listener()
-	async def on_loaded_extension(self, ext):
-		# See if we were loaded
-		if not self._is_submodule(ext.__name__, self.__module__):
-			return
-		self.is_current = True
-		self.bot.loop.create_task(self.addXP())
-		
-	async def addXP(self):
-		print("Starting XP loop: {}".format(datetime.datetime.now().time().isoformat()))
-		await self.bot.wait_until_ready()
-		while not self.bot.is_closed():
-			try:
-				await asyncio.sleep(600) # runs only every 10 minutes (600 seconds)
-				if not self.is_current:
-					# Bail if we're not the current instance
-					return
-				updates = await self.bot.loop.run_in_executor(None, self.update_xp)
-				t = time.time()
-				for update in updates:
-					await CheckRoles.checkroles(update["user"], update["chan"], self.settings, self.bot, **update["kwargs"])
-				# Sleep after for testing
-			except Exception as e:
-				print(str(e))
-
-	def update_xp(self):
-		responses = []
-		t = time.time()
-		print("Adding XP: {}".format(datetime.datetime.now().time().isoformat()))
-		# Get some values that don't require immediate query
-		server_dict = {}
-		for x in self.bot.get_all_members():
-			memlist = server_dict.get(str(x.guild.id), [])
-			memlist.append(x)
-			server_dict[str(x.guild.id)] = memlist
-		for server_id in server_dict:
-			server = self.bot.get_guild(int(server_id))
-			if not server:
-				continue
-			# Iterate through the servers and add them
-			xpAmount   = int(self.settings.getServerStat(server, "HourlyXP"))
-			xpAmount   = float(xpAmount/6)
-			xpRAmount  = int(self.settings.getServerStat(server, "HourlyXPReal"))
-			xpRAmount  = float(xpRAmount/6)
-
-			xpLimit    = self.settings.getServerStat(server, "XPLimit")
-			xprLimit   = self.settings.getServerStat(server, "XPReserveLimit")
-			
-			onlyOnline = self.settings.getServerStat(server, "RequireOnline")
-			requiredXP = self.settings.getServerStat(server, "RequiredXPRole")
-			promoArray  = self.settings.getServerStat(server, "PromotionArray")
-
-			xpblock = self.settings.getServerStat(server, "XpBlockArray")
-			targetChanID = self.settings.getServerStat(server, "DefaultChannel")
-			kwargs = {
-					"xp_promote":self.settings.getServerStat(server,"XPPromote"),
-					"xp_demote":self.settings.getServerStat(server,"XPDemote"),
-					"suppress_promotions":self.settings.getServerStat(server,"SuppressPromotions"),
-					"suppress_demotions":self.settings.getServerStat(server,"SuppressDemotions"),
-					"only_one_role":self.settings.getServerStat(server,"OnlyOneRole")
-			}
-			
-			for user in server_dict[server_id]:
-
-				# First see if we're current - we want to bail quickly
-				if not self.is_current:
-					print("XP Interrupted, no longer current - took {} seconds.".format(time.time() - t))
-					return responses
-				
-				if not self._can_xp(user, server, requiredXP, promoArray):
-					continue
-
-				bumpXP = False
-				if onlyOnline == False:
-					bumpXP = True
-				else:
-					if user.status == discord.Status.online:
-						bumpXP = True
-
-				# Check if we're blocked
-				if user.id in xpblock:
-					# No xp for you
-					continue
-
-				for role in user.roles:
-					if role.id in xpblock:
-						bumpXP = False
-						break
-						
-				if bumpXP:
-					if xpAmount > 0:
-						# User is online add hourly xp reserve
-						
-						# First we check if we'll hit our limit
-						skip = False
-						if not xprLimit == None:
-							# Get the current values
-							newxp = self.settings.getUserStat(user, server, "XPReserve")
-							# Make sure it's this xpr boost that's pushing us over
-							# This would only push us up to the max, but not remove
-							# any we've already gotten
-							if newxp + xpAmount > xprLimit:
-								skip = True
-								if newxp < xprLimit:
-									self.settings.setUserStat(user, server, "XPReserve", xprLimit)
-						if not skip:
-							xpLeftover = self.settings.getUserStat(user, server, "XPLeftover")
-
-							if xpLeftover == None:
-								xpLeftover = 0
-							else:
-								xpLeftover = float(xpLeftover)
-							gainedXp = xpLeftover+xpAmount
-							gainedXpInt = int(gainedXp) # Strips the decimal point off
-							xpLeftover = float(gainedXp-gainedXpInt) # Gets the < 1 value
-							self.settings.setUserStat(user, server, "XPLeftover", xpLeftover)
-							self.settings.incrementStat(user, server, "XPReserve", gainedXpInt)
-					
-					if xpRAmount > 0:
-						# User is online add hourly xp
-
-						# First we check if we'll hit our limit
-						skip = False
-						if not xpLimit == None:
-							# Get the current values
-							newxp = self.settings.getUserStat(user, server, "XP")
-							# Make sure it's this xpr boost that's pushing us over
-							# This would only push us up to the max, but not remove
-							# any we've already gotten
-							if newxp + xpRAmount > xpLimit:
-								skip = True
-								if newxp < xpLimit:
-									self.settings.setUserStat(user, server, "XP", xpLimit)
-						if not skip:
-							xpRLeftover = self.settings.getUserStat(user, server, "XPRealLeftover")
-							if xpRLeftover == None:
-								xpRLeftover = 0
-							else:
-								xpRLeftover = float(xpRLeftover)
-							gainedXpR = xpRLeftover+xpRAmount
-							gainedXpRInt = int(gainedXpR) # Strips the decimal point off
-							xpRLeftover = float(gainedXpR-gainedXpRInt) # Gets the < 1 value
-							self.settings.setUserStat(user, server, "XPRealLeftover", xpRLeftover)
-							self.settings.incrementStat(user, server, "XP", gainedXpRInt)
-
-						# Check our default channels
-						targetChan = None
-						if len(str(targetChanID)):
-							# We *should* have a channel
-							tChan = self.bot.get_channel(int(targetChanID))
-							if tChan:
-								# We *do* have one
-								targetChan = tChan
-						responses.append({"user":user, "chan":targetChan if targetChan else self.bot.get_guild(int(server_id)), "kwargs":kwargs})
-		print("XP Done - took {} seconds.".format(time.time() - t))
-		return responses
-
-	@commands.command(pass_context=True)
-	async def xp(self, ctx, *, member = None, xpAmount : int = None):
-		"""Gift xp to other members."""
-
-		author  = ctx.message.author
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(server, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-
-		usage = 'Usage: `{}xp [role/member] [amount]`'.format(ctx.prefix)
-
-		isRole = False
-
-		if member == None:
-			await ctx.message.channel.send(usage)
-			return
-
-		# Check for formatting issues
-		if xpAmount == None:
-			# Either xp wasn't set - or it's the last section
-			if type(member) is str:
-				# It' a string - the hope continues
-				roleCheck = DisplayName.checkRoleForInt(member, server)
-				if not roleCheck:
-					# Returned nothing - means there isn't even an int
-					msg = 'I couldn\'t find *{}* on the server.'.format(Nullify.escape_all(member))
-					await ctx.message.channel.send(msg)
-					return
-				if roleCheck["Role"]:
-					isRole = True
-					member   = roleCheck["Role"]
-					xpAmount = roleCheck["Int"]
-				else:
-					# Role is invalid - check for member instead
-					nameCheck = DisplayName.checkNameForInt(member, server)
-					if not nameCheck:
-						await ctx.message.channel.send(usage)
-						return
-					if not nameCheck["Member"]:
-						msg = 'I couldn\'t find *{}* on the server.'.format(Nullify.escape_all(member))
-						await ctx.message.channel.send(msg)
-						return
-					member   = nameCheck["Member"]
-					xpAmount = nameCheck["Int"]
-
-		if xpAmount == None:
-			# Still no xp - let's run stats instead
-			if isRole:
-				await ctx.message.channel.send(usage)
-			else:
-				await ctx.invoke(self.stats, member=member)
-			return
-		if not type(xpAmount) is int:
-			await ctx.message.channel.send(usage)
-			return
-
-		# Get our user/server stats
-		isAdmin         = author.permissions_in(channel).administrator
-		checkAdmin = self.settings.getServerStat(ctx.message.guild, "AdminArray")
-		# Check for bot admin
-		isBotAdmin      = False
-		for role in ctx.message.author.roles:
-			for aRole in checkAdmin:
-				# Get the role that corresponds to the id
-				if str(aRole['ID']) == str(role.id):
-					isBotAdmin = True
-					break
-
-		botAdminAsAdmin = self.settings.getServerStat(server, "BotAdminAsAdmin")
-		adminUnlim      = self.settings.getServerStat(server, "AdminUnlimited")
-		reserveXP       = self.settings.getUserStat(author, server, "XPReserve")
-		requiredXP      = self.settings.getServerStat(server, "RequiredXPRole")
-		xpblock         = self.settings.getServerStat(server, "XpBlockArray")
-
-		approve = True
-		decrement = True
-		admin_override = False
-
-		# RequiredXPRole
-		if not self._can_xp(author, server):
-			approve = False
-			msg = 'You don\'t have the permissions to give xp.'
-
-		if xpAmount > int(reserveXP):
-			approve = False
-			msg = 'You can\'t give *{:,} xp*, you only have *{:,}!*'.format(xpAmount, reserveXP)
-
-		if author == member:
-			approve = False
-			msg = 'You can\'t give yourself xp!  *Nice try...*'
-
-		if xpAmount < 0:
-			msg = 'Only admins can take away xp!'
-			approve = False
-			# Avoid admins gaining xp
-			decrement = False
-
-		if xpAmount == 0:
-			msg = 'Wow, very generous of you...'
-			approve = False
-
-		# Check bot admin
-		if isBotAdmin and botAdminAsAdmin:
-			# Approve as admin
-			approve = True
-			admin_override = True
-			if adminUnlim:
-				# No limit
-				decrement = False
-			else:
-				if xpAmount < 0:
-					# Don't decrement if negative
-					decrement = False
-				if xpAmount > int(reserveXP):
-					# Don't approve if we don't have enough
-					msg = 'You can\'t give *{:,} xp*, you only have *{:,}!*'.format(xpAmount, reserveXP)
-					approve = False
-			
-		# Check admin last - so it overrides anything else
-		if isAdmin:
-			# No limit - approve
-			approve = True
-			admin_override = True
-			if adminUnlim:
-				# No limit
-				decrement = False
-			else:
-				if xpAmount < 0:
-					# Don't decrement if negative
-					decrement = False
-				if xpAmount > int(reserveXP):
-					# Don't approve if we don't have enough
-					msg = 'You can\'t give *{:,} xp*, you only have *{:,}!*'.format(xpAmount, reserveXP)
-					approve = False
-
-		# Check author and target for blocks
-		# overrides admin because admins set this.
-		if type(member) is discord.Role:
-			if member.id in xpblock:
-				msg = "That role cannot receive xp!"
-				approve = False
-		else:
-			# User
-			if member.id in xpblock:
-				msg = "That member cannot receive xp!"
-				approve = False
-			else:
-				for role in member.roles:
-					if role.id in xpblock:
-						msg = "That member's role cannot receive xp!"
-						approve = False
-		
-		if ctx.author.id in xpblock:
-			msg = "You can't give xp!"
-			approve = False
-		else:
-			for role in ctx.author.roles:
-				if role.id in xpblock:
-					msg = "Your role cannot give xp!"
-					approve = False
-
-		if approve:
-
-			self.bot.dispatch("xp", member, ctx.author, xpAmount)
-
-			if isRole:
-				# XP was approved - let's iterate through the users of that role,
-				# starting with the lowest xp
-				#
-				# Work through our members
-				memberList = []
-				sMemberList = self.settings.getServerStat(server, "Members")
-				for amem in server.members:
-					if amem == author:
-						continue
-					if amem.id in xpblock:
-						# Blocked - only if not admin sending it
-						continue
-					roles = amem.roles
-					if member in roles:
-						# This member has our role
-						# Add to our list
-						for smem in sMemberList:
-							# Find our server entry
-							if str(smem) == str(amem.id):
-								# Add it.
-								sMemberList[smem]["ID"] = smem
-								memberList.append(sMemberList[smem])
-				memSorted = sorted(memberList, key=lambda x:int(x['XP']))
-				if len(memSorted):
-					# There actually ARE members in said role
-					totalXP = xpAmount
-					# Gather presets
-					xp_p = self.settings.getServerStat(server,"XPPromote")
-					xp_d = self.settings.getServerStat(server,"XPDemote")
-					xp_sp = self.settings.getServerStat(server,"SuppressPromotions")
-					xp_sd = self.settings.getServerStat(server,"SuppressDemotions")
-					xp_oo = self.settings.getServerStat(server,"OnlyOneRole")
-					if xpAmount > len(memSorted):
-						# More xp than members
-						leftover = xpAmount % len(memSorted)
-						eachXP = (xpAmount-leftover)/len(memSorted)
-						for i in range(0, len(memSorted)):
-							# Make sure we have anything to give
-							if leftover <= 0 and eachXP <= 0:
-								break
-							# Carry on with our xp distribution
-							cMember = DisplayName.memberForID(memSorted[i]['ID'], server)
-							if leftover>0:
-								self.settings.incrementStat(cMember, server, "XP", eachXP+1)
-								leftover -= 1
-							else:
-								self.settings.incrementStat(cMember, server, "XP", eachXP)
-							await CheckRoles.checkroles(
-								cMember,
-								channel,
-								self.settings,
-								self.bot,
-								xp_promote=xp_p,
-								xp_demote=xp_d,
-								suppress_promotions=xp_sp,
-								suppress_demotions=xp_sd,
-								only_one_role=xp_oo)
-					else:
-						for i in range(0, xpAmount):
-							cMember = DisplayName.memberForID(memSorted[i]['ID'], server)
-							self.settings.incrementStat(cMember, server, "XP", 1)
-							await CheckRoles.checkroles(
-								cMember,
-								channel,
-								self.settings,
-								self.bot,
-								xp_promote=xp_p,
-								xp_demote=xp_d,
-								suppress_promotions=xp_sp,
-								suppress_demotions=xp_sd,
-								only_one_role=xp_oo)
-
-					# Decrement if needed
-					if decrement:
-						self.settings.incrementStat(author, server, "XPReserve", (-1*xpAmount))
-					msg = '*{:,} collective xp* was given to *{}!*'.format(totalXP, Nullify.escape_all(member.name))
-					await channel.send(msg)
-				else:
-					msg = 'There are no eligible members in *{}!*'.format(Nullify.escape_all(member.name))
-					await channel.send(msg)
-
-			else:
-				# Decrement if needed
-				if decrement:
-					self.settings.incrementStat(author, server, "XPReserve", (-1*xpAmount))
-				# XP was approved!  Let's say it - and check decrement from gifter's xp reserve
-				msg = '*{}* was given *{:,} xp!*'.format(DisplayName.name(member), xpAmount)
-				await channel.send(msg)
-				self.settings.incrementStat(member, server, "XP", xpAmount)
-				# Now we check for promotions
-				await CheckRoles.checkroles(member, channel, self.settings, self.bot)
-		else:
-			await channel.send(msg)
-			
-	'''@xp.error
-	async def xp_error(self, ctx, error):
-		msg = 'xp Error: {}'.format(error)
-		await ctx.channel.send(msg)'''
-
-	@commands.command(pass_context=True)
-	async def defaultrole(self, ctx):
-		"""Lists the default role that new users are assigned."""
-
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(ctx.message.guild, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-
-		role = self.settings.getServerStat(ctx.message.guild, "DefaultRole")
-		if role == None or role == "":
-			msg = 'New users are not assigned a role on joining this server.'
-			await ctx.channel.send(msg)
-		else:
-			# Role is set - let's get its name
-			found = False
-			for arole in ctx.message.guild.roles:
-				if str(arole.id) == str(role):
-					found = True
-					msg = 'New users will be assigned to **{}**.'.format(Nullify.escape_all(arole.name))
-			if not found:
-				msg = 'There is no role that matches id: `{}` - consider updating this setting.'.format(role)
-			await ctx.message.channel.send(msg)
-		
-	@commands.command(pass_context=True)
-	async def gamble(self, ctx, bet : int = None):
-		"""Gamble your xp reserves for a chance at winning xp!"""
-		
-		author  = ctx.message.author
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-		
-		# bet must be a multiple of 10, member must have enough xpreserve to bet
-		msg = 'Usage: `{}gamble [xp reserve bet] (must be multiple of 10)`'.format(ctx.prefix)
-		
-		if not (bet or type(bet) == int):
-			await channel.send(msg)
-			return
-			
-		if not type(bet) == int:
-			await channel.send(msg)
-			return
-
-		isAdmin    = author.permissions_in(channel).administrator
-		checkAdmin = self.settings.getServerStat(ctx.message.guild, "AdminArray")
-		# Check for bot admin
-		isBotAdmin      = False
-		for role in ctx.message.author.roles:
-			for aRole in checkAdmin:
-				# Get the role that corresponds to the id
-				if str(aRole['ID']) == str(role.id):
-					isBotAdmin = True
-					break
-		botAdminAsAdmin = self.settings.getServerStat(server, "BotAdminAsAdmin")
-		adminUnlim = self.settings.getServerStat(server, "AdminUnlimited")
-		reserveXP  = self.settings.getUserStat(author, server, "XPReserve")
-		minRole    = self.settings.getServerStat(server, "MinimumXPRole")
-		requiredXP = self.settings.getServerStat(server, "RequiredXPRole")
-		xpblock    = self.settings.getServerStat(server, "XpBlockArray")
-
-		approve = True
-		decrement = True
-
-		# Check Bet
-			
-		if not bet % 10 == 0:
-			approve = False
-			msg = 'Bets must be in multiples of *10!*'
-			
-		if bet > int(reserveXP):
-			approve = False
-			msg = 'You can\'t bet *{:,}*, you only have *{:,}* xp reserve!'.format(bet, reserveXP)
-			
-		if bet < 0:
-			msg = 'You can\'t bet negative amounts!'
-			approve = False
-			
-		if bet == 0:
-			msg = 'You can\'t bet *nothing!*'
-			approve = False
-
-		# RequiredXPRole
-		if not self._can_xp(author, server):
-			approve = False
-			msg = 'You don\'t have the permissions to gamble.'
-				
-		# Check bot admin
-		if isBotAdmin and botAdminAsAdmin:
-			# Approve as admin
-			approve = True
-			if adminUnlim:
-				# No limit
-				decrement = False
-			else:
-				if bet < 0:
-					# Don't decrement if negative
-					decrement = False
-				if bet > int(reserveXP):
-					# Don't approve if we don't have enough
-					msg = 'You can\'t bet *{:,}*, you only have *{:,}* xp reserve!'.format(bet, reserveXP)
-					approve = False
-			
-		# Check admin last - so it overrides anything else
-		if isAdmin:
-			# No limit - approve
-			approve = True
-			if adminUnlim:
-				# No limit
-				decrement = False
-			else:
-				if bet < 0:
-					# Don't decrement if negative
-					decrement = False
-				if bet > int(reserveXP):
-					# Don't approve if we don't have enough
-					msg = 'You can\'t bet *{:,}*, you only have *{:,}* xp reserve!'.format(bet, reserveXP)
-					approve = False
-
-		# Check if we're blocked
-		if ctx.author.id in xpblock:
-			msg = "You can't gamble for xp!"
-			approve = False
-		else:
-			for role in ctx.author.roles:
-				if role.id in xpblock:
-					msg = "Your role cannot gamble for xp!"
-					approve = False
-			
-		if approve:
-			# Bet was approved - let's take the XPReserve right away
-			if decrement:
-				takeReserve = -1*bet
-				self.settings.incrementStat(author, server, "XPReserve", takeReserve)
-			
-			# Bet more, less chance of winning, but more winnings!
-			if bet < 100:
-				betChance = 5
-				payout = int(bet/10)
-			elif bet < 500:
-				betChance = 15
-				payout = int(bet/4)
-			else:
-				betChance = 25
-				payout = int(bet/2)
-			
-			# 1/betChance that user will win - and payout is 1/10th of the bet
-			randnum = random.randint(1, betChance)
-			# print('{} : {}'.format(randnum, betChance))
-			if randnum == 1:
-				# YOU WON!!
-				self.settings.incrementStat(author, server, "XP", int(payout))
-				msg = '*{}* bet *{:,}* and ***WON*** *{:,} xp!*'.format(DisplayName.name(author), bet, int(payout))
-				# Now we check for promotions
-				await CheckRoles.checkroles(author, channel, self.settings, self.bot)
-			else:
-				msg = '*{}* bet *{:,}* and.... *didn\'t* win.  Better luck next time!'.format(DisplayName.name(author), bet)
-			
-		await ctx.message.channel.send(msg)
-			
-	@commands.command(pass_context=True)
-	async def recheckroles(self, ctx):
-		"""Re-iterate through all members and assign the proper roles based on their xp (admin only)."""
-
-		author  = ctx.message.author
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-
-		isAdmin = author.permissions_in(channel).administrator
-
-		# Only allow admins to change server stats
-		if not isAdmin:
-			await channel.send('You do not have sufficient privileges to access this command.')
-			return
-		
-		# Gather presets
-		xp_p = self.settings.getServerStat(server,"XPPromote")
-		xp_d = self.settings.getServerStat(server,"XPDemote")
-		xp_sp = self.settings.getServerStat(server,"SuppressPromotions")
-		xp_sd = self.settings.getServerStat(server,"SuppressDemotions")
-		xp_oo = self.settings.getServerStat(server,"OnlyOneRole")
-		message = await ctx.channel.send('Checking roles...')
-
-		changeCount = 0
-		for member in server.members:
-			# Now we check for promotions
-			if await CheckRoles.checkroles(
-								member,
-								channel,
-								self.settings,
-								self.bot,
-								True,
-								xp_promote=xp_p,
-								xp_demote=xp_d,
-								suppress_promotions=xp_sp,
-								suppress_demotions=xp_sd,
-								only_one_role=xp_oo):
-				changeCount += 1
-		
-		if changeCount == 1:
-			await message.edit(content='Done checking roles.\n\n*1 user* updated.')
-			#await channel.send('Done checking roles.\n\n*1 user* updated.')
-		else:
-			await message.edit(content='Done checking roles.\n\n*{:,} users* updated.'.format(changeCount))
-			#await channel.send('Done checking roles.\n\n*{} users* updated.'.format(changeCount))
-
-	@commands.command(pass_context=True)
-	async def recheckrole(self, ctx, *, user : discord.Member = None):
-		"""Re-iterate through all members and assign the proper roles based on their xp (admin only)."""
-
-		author  = ctx.message.author
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-
-		isAdmin = author.permissions_in(channel).administrator
-
-		# Only allow admins to change server stats
-		if not isAdmin:
-			await channel.send('You do not have sufficient privileges to access this command.')
-			return
-
-		if not user:
-			user = author
-
-		# Now we check for promotions
-		if await CheckRoles.checkroles(user, channel, self.settings, self.bot):
-			await channel.send('Done checking roles.\n\n*{}* was updated.'.format(DisplayName.name(user)))
-		else:
-			await channel.send('Done checking roles.\n\n*{}* was not updated.'.format(DisplayName.name(user)))
-
-
-
-	@commands.command(pass_context=True)
-	async def listxproles(self, ctx):
-		"""Lists all roles, id's, and xp requirements for the xp promotion/demotion system."""
-		
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(server, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-		
-		# Get the array
-		promoArray = self.settings.getServerStat(server, "PromotionArray")
-
-		# Sort by XP first, then by name
-		# promoSorted = sorted(promoArray, key=itemgetter('XP', 'Name'))
-		promoSorted = sorted(promoArray, key=lambda x:int(x['XP']))
-		
-		if not len(promoSorted):
-			roleText = "There are no roles in the xp role list.  You can add some with the `{}addxprole [role] [xpamount]` command!\n".format(ctx.prefix)
-		else:
-			roleText = "**__Current Roles:__**\n\n"
-			for arole in promoSorted:
-				# Get current role name based on id
-				foundRole = False
-				for role in server.roles:
-					if str(role.id) == str(arole['ID']):
-						# We found it
-						foundRole = True
-						roleText = '{}**{}** : *{:,} XP*\n'.format(roleText, Nullify.escape_all(role.name), arole['XP'])
-				if not foundRole:
-					roleText = '{}**{}** : *{:,} XP* (removed from server)\n'.format(roleText, Nullify.escape_all(arole['Name']), arole['XP'])
-
-		# Get the required role for using the xp system
-		role = self.settings.getServerStat(ctx.message.guild, "RequiredXPRole")
-		if role == None or role == "":
-			roleText = '{}\n**Everyone** can give xp, gamble, and feed the bot.'.format(roleText)
-		else:
-			# Role is set - let's get its name
-			found = False
-			for arole in ctx.message.guild.roles:
-				if str(arole.id) == str(role):
-					found = True
-					vowels = "aeiou"
-					if arole.name[:1].lower() in vowels:
-						roleText = '{}\nYou need to be an **{}** to *give xp*, *gamble*, or *feed* the bot.'.format(roleText, Nullify.escape_all(arole.name))
-					else:
-						roleText = '{}\nYou need to be a **{}** to *give xp*, *gamble*, or *feed* the bot.'.format(roleText, Nullify.escape_all(arole.name))
-					# roleText = '{}\nYou need to be a/an **{}** to give xp, gamble, or feed the bot.'.format(roleText, arole.name)
-			if not found:
-				roleText = '{}\nThere is no role that matches id: `{}` for using the xp system - consider updating that setting.'.format(roleText, role)
-
-		await channel.send(roleText)
-		
-		
-	@commands.command(pass_context=True)
-	async def rank(self, ctx, *, member = None):
-		"""Say the highest rank of a listed member."""
-		
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(ctx.message.guild, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-
-		if member is None:
-			member = ctx.message.author
-			
-		if type(member) is str:
-			memberName = member
-			member = DisplayName.memberForName(memberName, ctx.message.guild)
-			if not member:
-				msg = 'I couldn\'t find *{}*...'.format(Nullify.escape_all(memberName))
-				await ctx.message.channel.send(msg)
-				return
-			
-		# Create blank embed
-		stat_embed = discord.Embed(color=member.color)
-			
-		promoArray = self.settings.getServerStat(ctx.message.guild, "PromotionArray")
-		# promoSorted = sorted(promoArray, key=itemgetter('XP', 'Name'))
-		promoSorted = sorted(promoArray, key=lambda x:int(x['XP']))
-		
-		
-		memName = member.name
-		# Get member's avatar url
-		avURL = member.avatar_url
-		if not len(avURL):
-			avURL = member.default_avatar_url
-		if member.nick:
-			# We have a nickname
-			# Add to embed
-			stat_embed.set_author(name='{}, who currently goes by {}'.format(member.name, member.nick), icon_url=avURL)
-		else:
-			# Add to embed
-			stat_embed.set_author(name='{}'.format(member.name), icon_url=avURL)
-			
-		
-		highestRole = ""
-		
-		for role in promoSorted:
-			# We *can* have this role, let's see if we already do
-			currentRole = None
-			for aRole in member.roles:
-				# Get the role that corresponds to the id
-				if str(aRole.id) == str(role['ID']):
-					# We found it
-					highestRole = aRole.name
-
-		if highestRole == "":
-			msg = '*{}* has not acquired a rank yet.'.format(DisplayName.name(member))
-			# Add Rank
-			stat_embed.add_field(name="Current Rank", value='None acquired yet', inline=True)
-		else:
-			msg = '*{}* is a **{}**!'.format(DisplayName.name(member), highestRole)
-			# Add Rank
-			stat_embed.add_field(name="Current Rank", value=highestRole, inline=True)
-			
-		# await ctx.message.channel.send(msg)
-		await ctx.message.channel.send(embed=stat_embed)
-		
-	@rank.error
-	async def rank_error(self, error, ctx):
-		msg = 'rank Error: {}'.format(error)
-		await ctx.channel.send(msg)
-
-
-	# List the top 10 xp-holders
-	@commands.command(pass_context=True)
-	async def leaderboard(self, ctx, total : int = 10):
-		"""List the top xp-holders (max of 50)."""
-		message = await ctx.send("Counting xp...")
-		promoArray = {}
-		for x in self.bot.get_all_members():
-			if not x.guild.id == ctx.guild.id:
-				continue
-			promoArray[str(x.id)] = {"XP":await self.bot.loop.run_in_executor(None, self.settings.getUserStat,x,x.guild,"XP")}
-		promoSorted = sorted(promoArray, key=lambda x:int(promoArray[x]['XP']))
-
-		startIndex = 0
-		if total > 50:
-			total = 50
-		if total < 1:
-			total = 1
-		msg = ""
-
-		if len(promoSorted) < total:
-			total = len(promoSorted)
-		
-		if len(promoSorted):
-			# makes sure we have at least 1 user - shouldn't be necessary though
-			startIndex = len(promoSorted)-1
-			msg = "**Top** ***{}*** **XP-Holders in** ***{}***:\n".format(total, Nullify.escape_all(ctx.guild.name))
-
-		for i in range(0, total):
-			# Loop through from startIndex to startIndex+total-1
-			index = startIndex-i
-			# cMemName = "{}#{}".format(promoSorted[index]['Name'], promoSorted[index]['Discriminator'])
-			cMember = DisplayName.memberForID(promoSorted[index], ctx.message.guild)
-			#if ctx.message.guild.get_member_named(cMemName):
-				# Member exists
-				#cMember = ctx.message.guild.get_member_named(cMemName)
-			#else:
-				#cMember = None
-			if cMember:
-				cMemberDisplay = DisplayName.name(cMember)
-			else:
-				cMemberDisplay = promoSorted[index]
-
-			msg = '{}\n{}. *{}* - *{:,} xp*'.format(msg, i+1, cMemberDisplay, promoArray[promoSorted[index]]['XP'])
-
-		await message.edit(content=msg)
-
-		
-	# List the top 10 xp-holders
-	@commands.command(pass_context=True)
-	async def bottomxp(self, ctx, total : int = 10):
-		"""List the bottom xp-holders (max of 50)."""
-		message = await ctx.send("Counting xp...")
-		promoArray = {}
-		for x in self.bot.get_all_members():
-			if not x.guild.id == ctx.guild.id:
-				continue
-			promoArray[str(x.id)] = {"XP":await self.bot.loop.run_in_executor(None, self.settings.getUserStat,x,x.guild,"XP")}
-		promoSorted = sorted(promoArray, key=lambda x:int(promoArray[x]['XP']))
-
-		startIndex = 0
-		if total > 50:
-			total = 50
-		if total < 1:
-			total = 1
-		msg = ""
-
-		if len(promoSorted) < total:
-			total = len(promoSorted)
-		
-		if len(promoSorted):
-			# makes sure we have at least 1 user - shouldn't be necessary though
-			msg = "**Bottom** ***{}*** **XP-Holders in** ***{}***:\n".format(total, Nullify.escape_all(ctx.guild.name))
-
-		for i in range(0, total):
-			# Loop through from startIndex to startIndex+total-1
-			index = startIndex+i
-			# cMemName = "{}#{}".format(promoSorted[index]['Name'], promoSorted[index]['Discriminator'])
-			cMember = DisplayName.memberForID(promoSorted[index], ctx.message.guild)
-			#if ctx.message.guild.get_member_named(cMemName):
-				# Member exists
-				#cMember = ctx.message.guild.get_member_named(cMemName)
-			#else:
-				#cMember = None
-			if cMember:
-					cMemberDisplay = DisplayName.name(cMember)
-			else:
-				cMemberDisplay = promoSorted[index]
-			msg = '{}\n{}. *{}* - *{:,} xp*'.format(msg, i+1, cMemberDisplay, promoArray[promoSorted[index]]['XP'])
-
-		await message.edit(content=msg)
-		
-		
-	# List the xp and xp reserve of a user
-	@commands.command(pass_context=True)
-	async def stats(self, ctx, *, member= None):
-		"""List the xp and xp reserve of a listed member."""
-		
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(ctx.message.guild, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-		
-		if member is None:
-			member = ctx.message.author
-			
-		if type(member) is str:
-			memberName = member
-			member = DisplayName.memberForName(memberName, ctx.message.guild)
-			if not member:
-				msg = 'I couldn\'t find *{}*...'.format(Nullify.escape_all(memberName))
-				await ctx.message.channel.send(msg)
-				return
-
-		url = member.avatar_url
-		if not len(url):
-			url = member.default_avatar_url
-
-		# Create blank embed
-		stat_embed = discord.Embed(color=member.color)
-						
-		stat_embed.set_thumbnail(url=url)
-
-		# Get user's xp
-		newStat = int(self.settings.getUserStat(member, ctx.message.guild, "XP"))
-		newState = int(self.settings.getUserStat(member, ctx.message.guild, "XPReserve"))
-		
-		# Add XP and XP Reserve
-		stat_embed.add_field(name="XP", value="{:,}".format(newStat), inline=True)
-		stat_embed.add_field(name="XP Reserve", value="{:,}".format(newState), inline=True)
-		
-		memName = member.name
-		# Get member's avatar url
-		avURL = member.avatar_url
-		if not len(avURL):
-			avURL = member.default_avatar_url
-		if member.nick:
-			# We have a nickname
-			msg = "__***{},*** **who currently goes by** ***{}:***__\n\n".format(member.name, member.nick)
-			
-			# Add to embed
-			stat_embed.set_author(name='{}, who currently goes by {}'.format(member.name, member.nick))
-		else:
-			msg = "__***{}:***__\n\n".format(member.name)
-			# Add to embed
-			stat_embed.set_author(name='{}'.format(member.name))
-		# Get localized user time
-		if member.joined_at != None:
-			local_time = UserTime.getUserTime(ctx.author, self.settings, member.joined_at)
-			j_time_str = "{} {}".format(local_time['time'], local_time['zone'])
-		
-			# Add Joined
-			stat_embed.add_field(name="Joined", value=j_time_str, inline=True)
-		else:
-			stat_embed.add_field(name="Joined", value="Unknown", inline=True)
-
-		# Get user's current role
-		promoArray = self.settings.getServerStat(ctx.message.guild, "PromotionArray")
-		# promoSorted = sorted(promoArray, key=itemgetter('XP', 'Name'))
-		promoSorted = sorted(promoArray, key=lambda x:int(x['XP']))
-		
-		highestRole = None
-		if len(promoSorted):
-			nextRole = promoSorted[0]
-		else:
-			nextRole = None
-
-		for role in promoSorted:
-			if int(nextRole['XP']) < newStat:
-				nextRole = role
-			# We *can* have this role, let's see if we already do
-			currentRole = None
-			for aRole in member.roles:
-				# Get the role that corresponds to the id
-				if str(aRole.id) == str(role['ID']):
-					# We found it
-					highestRole = aRole.name
-					if len(promoSorted) > (promoSorted.index(role)+1):
-						# There's more roles above this
-						nRoleIndex = promoSorted.index(role)+1
-						nextRole = promoSorted[nRoleIndex]
-
-		if highestRole:
-			msg = '{}**Current Rank:** *{}*\n'.format(msg, highestRole)
-			# Add Rank
-			stat_embed.add_field(name="Current Rank", value=highestRole, inline=True)
-		else:
-			if len(promoSorted):
-				# Need to have ranks to acquire one
-				msg = '{}They have not acquired a rank yet.\n'.format(msg)
-				# Add Rank
-				stat_embed.add_field(name="Current Rank", value='None acquired yet', inline=True)
-		
-		if nextRole and (newStat < int(nextRole['XP'])):
-			# Get role
-			next_role = DisplayName.roleForID(int(nextRole["ID"]), ctx.guild)
-			if not next_role:
-				next_role_text = "Role ID: {} (Removed from server)".format(nextRole["ID"])
-			else:
-				next_role_text = next_role.name
-			msg = '{}\n*{:,}* more *xp* required to advance to **{}**'.format(msg, int(nextRole['XP']) - newStat, next_role_text)
-			# Add Next Rank
-			stat_embed.add_field(name="Next Rank", value='{} ({:,} more xp required)'.format(next_role_text, int(nextRole['XP'])-newStat), inline=True)
-			
-		# Add status
-		status_text = ":green_heart:"
-		if member.status == discord.Status.offline:
-			status_text = ":black_heart:"
-		elif member.status == discord.Status.dnd:
-			status_text = ":heart:"
-		elif member.status == discord.Status.idle:
-			status_text = ":yellow_heart:"
-		stat_embed.add_field(name="Status", value=status_text, inline=True)
-
-		stat_embed.add_field(name="ID", value=str(member.id), inline=True)
-		stat_embed.add_field(name="User Name", value="{}#{}".format(member.name, member.discriminator), inline=True)
-		if member.premium_since:
-			local_time = UserTime.getUserTime(ctx.author, self.settings, member.premium_since, clock=True)
-			c_time_str = "{} {}".format(local_time['time'], local_time['zone'])
-			stat_embed.add_field(name="Boosting Since",value=c_time_str)
-		
-		if member.activity and member.activity.name:
-			# Playing a game!
-			play_list = [ "Playing", "Streaming", "Listening to", "Watching" ]
-			try:
-				play_string = play_list[member.activity.type]
-			except:
-				play_string = "Playing"
-			stat_embed.add_field(name=play_string, value=str(member.activity.name), inline=True)
-			if member.activity.type == 1:
-				# Add the URL too
-				stat_embed.add_field(name="Stream URL", value="[Watch Now]({})".format(member.activity.url), inline=True)
-		# Add joinpos
-		joinedList = sorted([{"ID":mem.id,"Joined":mem.joined_at} for mem in ctx.guild.members], key=lambda x:x["Joined"].timestamp() if x["Joined"] != None else -1)
-
-		if member.joined_at != None:
-			try:
-				check_item = { "ID" : member.id, "Joined" : member.joined_at }
-				total = len(joinedList)
-				position = joinedList.index(check_item) + 1
-				stat_embed.add_field(name="Join Position", value="{:,} of {:,}".format(position, total), inline=True)
-			except:
-				stat_embed.add_field(name="Join Position", value="Unknown", inline=True)
-		else:
-			stat_embed.add_field(name="Join Position", value="Unknown", inline=True)
-		
-		# Get localized user time
-		local_time = UserTime.getUserTime(ctx.author, self.settings, member.created_at, clock=False)
-		c_time_str = "{} {}".format(local_time['time'], local_time['zone'])
-		# add created_at footer
-		created = "Created at " + c_time_str
-		stat_embed.set_footer(text=created)
-
-		#await ctx.message.channel.send(msg)
-		await ctx.send(embed=stat_embed)
-		
-	@stats.error
-	async def stats_error(self, ctx, error):
-		msg = 'stats Error: {}'.format(error)
-		await ctx.channel.send(msg)
-
-
-	# List the xp and xp reserve of a user
-	@commands.command(pass_context=True)
-	async def xpinfo(self, ctx):
-		"""Gives a quick rundown of the xp system."""
-
-		server  = ctx.message.guild
-		channel = ctx.message.channel
-
-		# Check if we're suppressing @here and @everyone mentions
-		if self.settings.getServerStat(server, "SuppressMentions"):
-			suppress = True
-		else:
-			suppress = False
-
-		serverName = Nullify.escape_all(server.name)
-		hourlyXP = int(self.settings.getServerStat(server, "HourlyXP"))
-		hourlyXPReal = int(self.settings.getServerStat(server, "HourlyXPReal"))
-		xpPerMessage = int(self.settings.getServerStat(server, "XPPerMessage"))
-		xpRPerMessage = int(self.settings.getServerStat(server, "XPRPerMessage"))
-		if not xpPerMessage:
-			xpPerMessage = 0
-		if not xpRPerMessage:
-			xpRPerMessage = 0
-		if not hourlyXPReal:
-			hourlyXPReal = 0
-		if not hourlyXP:
-			hourlyXP = 0
-		onlyOnline = self.settings.getServerStat(server, "RequireOnline")
-		xpProm = self.settings.getServerStat(server, "XPPromote")
-		xpDem = self.settings.getServerStat(server, "XPDemote")
-		xpStr = None
-
-		if xpProm and xpDem:
-			# Bot promote and demote
-			xpStr = "This is what I check to handle promotions and demotions.\n"
-		else:
-			if xpProm:
-				xpStr = "This is what I check to handle promotions.\n"
-			elif xpDem:
-				xpStr = "This is what I check to handle demotions.\n"
-
-		msg = "__***{}'s*** **XP System**__\n\n__What's What:__\n\n".format(serverName)
-		msg = "{}**XP:** This is the xp you have *earned.*\nIt comes from other users gifting you xp, or if you're lucky enough to `{}gamble` and win.\n".format(msg, ctx.prefix)
-		
-		if xpStr:
-			msg = "{}{}".format(msg, xpStr)
-		
-		hourStr = None
-		if hourlyXPReal > 0:
-			hourStr = "Currently, you receive *{} xp* each hour".format(hourlyXPReal)
-			if onlyOnline:
-				hourStr = "{} (but *only* if your status is *Online*).".format(hourStr)
-			else:
-				hourStr = "{}.".format(hourStr)
-		if hourStr:
-			msg = "{}{}\n".format(msg, hourStr)
-			
-		if xpPerMessage > 0:
-			msg = "{}Currently, you receive *{} xp* per message.\n".format(msg, xpPerMessage)
-			
-		msg = "{}This can only be taken away by an *admin*.\n\n".format(msg)
-		msg = "{}**XP Reserve:** This is the xp you can *gift*, *gamble*, or use to *feed* me.\n".format(msg)
-
-		hourStr = None
-		if hourlyXP > 0:
-			hourStr = "Currently, you receive *{} xp reserve* each hour".format(hourlyXP)
-			if onlyOnline:
-				hourStr = "{} (but *only* if your status is *Online*).".format(hourStr)
-			else:
-				hourStr = "{}.".format(hourStr)
-		
-		if hourStr:
-			msg = "{}{}\n".format(msg, hourStr)
-		
-		if xpRPerMessage > 0:
-			msg = "{}Currently, you receive *{} xp reserve* per message.\n".format(msg, xpRPerMessage)
-
-		msg = "{}\n__How Do I Use It?:__\n\nYou can gift other users xp by using the `{}xp [user] [amount]` command.\n".format(msg, ctx.prefix)
-		msg = "{}This pulls from your *xp reserve*, and adds to their *xp*.\n".format(msg)
-		msg = "{}It does not change the *xp* you have *earned*.\n\n".format(msg)
-
-		msg = "{}You can gamble your *xp reserve* to have a chance to win a percentage back as *xp* for yourself.\n".format(msg)
-		msg = "{}You do so by using the `{}gamble [amount in multiple of 10]` command.\n".format(msg, ctx.prefix)
-		msg = "{}This pulls from your *xp reserve* - and if you win, adds to your *xp*.\n\n".format(msg)
-
-		msg = "{}You can also *feed* me.\n".format(msg)
-		msg = "{}This is done with the `{}feed [amount]` command.\n".format(msg, ctx.prefix)
-		msg = "{}This pulls from your *xp reserve* - and doesn't affect your *xp*.\n\n".format(msg)
-		
-		msg = "{}You can check your *xp*, *xp reserve*, current role, and next role using the `{}stats` command.\n".format(msg, ctx.prefix)
-		msg = "{}You can check another user's stats with the `{}stats [user]` command.\n\n".format(msg, ctx.prefix)
-
-		# Get the required role for using the xp system
-		role = self.settings.getServerStat(server, "RequiredXPRole")
-		if role == None or role == "":
-			msg = '{}Currently, **Everyone** can *give xp*, *gamble*, and *feed* the bot.\n\n'.format(msg)
-		else:
-			# Role is set - let's get its name
-			found = False
-			for arole in server.roles:
-				if str(arole.id) == str(role):
-					found = True
-					vowels = "aeiou"
-					if arole.name[:1].lower() in vowels:
-						msg = '{}Currently, you need to be an **{}** to *give xp*, *gamble*, or *feed* the bot.\n\n'.format(msg, Nullify.escape_all(arole.name))
-					else:
-						msg = '{}Currently, you need to be a **{}** to *give xp*, *gamble*, or *feed* the bot.\n\n'.format(msg, Nullify.escape_all(arole.name))
-			if not found:
-				msg = '{}There is no role that matches id: `{}` for using the xp system - consider updating that setting.\n\n'.format(msg, role)
-
-		msg = "{}Hopefully that clears things up!".format(msg)
-
-		await ctx.message.channel.send(msg)
+from discord.ext import commands
+from discord import Member, Guild, User, PermissionOverwrite, TextChannel
+import os
+import json
+
+client = commands.Bot(command_prefix=commands.when_mentioned_or('='), help_command=None, intents=discord.Intents.all())
+
+autoroles = {
+    #814038818180825098: {'memberroles': [814038818193014803], 'botroles': [814038818193014802]}
+    816634292372373524: {'memberroles': [], 'botroles': [818757502472159233]}
+}
+
+permissionroles = {
+    816634292372373524: {'muteroles': [818542606039777352, 818604747249811476, 818603952580460564, 818604918109241415, 818606336136577045, 818606459742322718],
+                         'unmuteroles': [818542606039777352, 818604747249811476, 818603952580460564, 818604918109241415]}
+}
+
+global prefix
+prefix = "="
+
+#guild = client.get_guild(814038818180825098)
+#muterole = guild.get_role(814038818201272346)
+
+def is_not_pinned(mess):
+    return not mess.pinned
+
+def mutetime(userid, time, guild, reason):
+    with open('muted.json', 'r') as f:
+        muted = json.load(f)
+
+    finish = datetime.now() + timedelta(seconds=time)
+    finish2 = str(finish)
+    finish3 = finish2.split('.')
+    finish4 = datetime.strptime(finish3[0], '%Y-%m-%d %H:%M:%S')
+    print(finish4)
+
+    guildid = guild.id
+
+    muted[f'{guildid}'] = {}
+    muted[f'{guildid}'][f'{userid}'] = {}
+    muted[f'{guildid}'][f'{userid}']['time'] = str(finish4)
+    muted[f'{guildid}'][f'{userid}']['reason'] = reason
+
+    with open('muted.json', 'w') as f:
+        json.dump(muted, f)
+
+def bantime(userid, time, guild, reason):
+    with open('banned.json', 'r') as f:
+        banned = json.load(f)
+
+    finish = datetime.now() + timedelta(seconds=time)
+    finish2 = str(finish)
+    finish3 = finish2.split('.')
+    finish4 = datetime.strptime(finish3[0], '%Y-%m-%d %H:%M:%S')
+    print(finish4)
+
+    guildid = guild.id
+
+    banned[f'{guildid}'] = {}
+    banned[f'{guildid}'][f'{userid}'] = {}
+    banned[f'{guildid}'][f'{userid}']['time'] = str(finish4)
+    banned[f'{guildid}'][f'{userid}']['reason'] = reason
+
+    with open('banned.json', 'w') as f:
+        json.dump(banned, f)
+
+def check_muterole(guildid):
+    with open('settings.json', 'r') as f:
+        role_settings = json.load(f)
+    guild = client.get_guild(guildid)
+    if str(guild.id) in role_settings:
+        #print(f'id found for: {guild.name}')
+        muterole = role_settings[str(guild.id)]['muterole']
+        muterole = guild.get_role(int(muterole))
+        if str(muterole) != str(None):
+            #print(f'muterole for {guild.name} = {muterole}')
+            return muterole.id
+        else:
+            #print(f'muterole for {guild.name} not found')
+            return "NoneR"
+    else:
+        #print(f'id for: {guild.name} not found')
+        return "NoneG"
+
+def check_if_muted(member, guild):
+    print('Checking if muted!')
+    with open('muted.json', 'r') as f:
+        muted_users = json.load(f)
+    print(muted_users)
+    if member.id in muted_users[guild.id]:
+        print('mute')
+        return "True"
+    else:
+        print('not mute')
+        return "False"
+
+@client.event
+async def on_ready():
+    print('Wir sind eingeloggt als User {}'.format(client.user.name))
+    client.loop.create_task(check_muted())
+    client.loop.create_task(check_banned())
+    client.loop.create_task(status_task())
+    
+async def status_task():
+    while True:
+        await client.change_presence(activity=discord.Game('This is the LAC07 Bot by Ricci#4462!'), status=discord.Status.online)
+        await asyncio.sleep(10)
+        await client.change_presence(activity=discord.Game('If you need a discord Bot ask me! I can programm one for you!'), status=discord.Status.online)
+        await asyncio.sleep(10)
+
+async def check_muted():
+    while True:
+        await asyncio.sleep(1)
+        with open('muted.json', 'r') as f:
+            muted = json.load(f)
+        for i2, value2 in enumerate(muted):
+            guild = client.get_guild(int(value2))
+            muterole_id = check_muterole(guild.id)
+            if str(muterole_id) == str("NoneR"):
+                return
+            if str(muterole_id) == str("NoneG"):
+                return
+            muterole = guild.get_role(muterole_id)
+            for i, value in enumerate(muted[value2]):
+                now = datetime.now()
+                now2 = str(now)
+                now3 = now2.split('.')
+                if datetime.strptime(muted[value2][value]['time'], '%Y-%m-%d %H:%M:%S') < datetime.strptime(now3[0], '%Y-%m-%d %H:%M:%S'):
+                    with open('muted.json', 'r') as f:
+                        muted = json.load(f)
+
+                    member = guild.get_member(int(value))
+                    print(member)
+
+                    embed = discord.Embed(title="User UnMuted!",
+                                              description="**{0}** was unmuted!".format(member),
+                                              color=0xff00f6)
+                    embed.add_field(name='Reason', value="Mute Time over!")
+
+                    try:
+                        if not member.dm_channel:
+                            await member.create_dm()
+                        await member.dm_channel.send(embed=embed)
+                    except discord.errors.Forbidden:
+                        print('Es konnte keine unmute benachrichtigung an {0} gesendet werden.'.format(member.name))
+
+                    if muterole in member.roles:
+                        await member.remove_roles(muterole, reason='Mute Time over')
+
+                    muted.pop(value2)
+                    with open('muted.json', 'w') as f:
+                        json.dump(muted, f,)
+                else:
+                    member = guild.get_member(int(value))
+                    if muterole not in member.roles:
+                        await member.add_roles(muterole, reason='Mute Time not over')
+
+
+async def check_banned():
+    while True:
+        await asyncio.sleep(1)
+        with open('banned.json', 'r') as f:
+            banned = json.load(f)
+        for i2, value2 in enumerate(banned):
+            guild = client.get_guild(int(value2))
+            for i, value in enumerate(banned[value2]):
+                print(i)
+                now = datetime.now()
+                now2 = str(now)
+                now3 = now2.split('.')
+                if datetime.strptime(banned[value2][value]['time'], '%Y-%m-%d %H:%M:%S') <= datetime.strptime(now3[0], '%Y-%m-%d %H:%M:%S'):
+                    with open('banned.json', 'r') as f:
+                        banned = json.load(f)
+
+                    banned_users = await guild.bans()
+                    for ban_entry in banned_users:
+                        user = ban_entry.user
+                        print(user.id)
+                        print(value)
+                        if str(value) == str(user.id):
+                            await guild.unban(user)
+                            embed = discord.Embed(title="User UnBanned!",
+                                                  description="You were unbanned by the System!",
+                                                  color=0xff00f6)
+                            embed.add_field(name='Reason', value="Ban Time over!")
+                            try:
+                                if not user.dm_channel:
+                                    await user.create_dm()
+                                await user.dm_channel.send(embed=embed)
+                            except discord.errors.Forbidden:
+                                print('Es konnte keine DM an {0} gesendet werden.'.format(user.name))
+                            await user.send(embed=embed)
+
+                            banned.pop(value2)
+                            with open('banned.json', 'w') as f:
+                                json.dump(banned, f, )
+
+                        else:
+                            print("fail")
+
+@client.event
+async def on_raw_reaction_add(payload):
+    guild = payload.guild_id
+    check_in = ["818608854421078038"]
+    if str(payload.guild_id) != "816634292372373524":
+        return  # Reaction is on a private message
+    guild = client.get_guild(payload.guild_id)
+    role = guild.get_role(818606628307075142)
+    member = guild.get_member(payload.user_id)
+    if str(payload.channel_id) in check_in:
+        if not member.bot:
+            await member.add_roles(role, reason="verified")
+
+@client.event
+async def on_raw_reaction_remove(payload):
+    guild = payload.guild_id
+    check_in = ["818608854421078038"]
+    if str(payload.guild_id) != "816634292372373524":
+        return  # Reaction is on a private message
+    guild = client.get_guild(payload.guild_id)
+    role = guild.get_role(818606628307075142)
+    member = guild.get_member(payload.user_id)
+    if str(payload.channel_id) in check_in:
+        if not member.bot:
+            await member.remove_roles(role, reason="verified")
+
+@client.event
+async def on_member_join(member):
+    print(member)
+    guild = client.get_guild(816634292372373524)
+    if str(member.id) == "685797014440771598":
+        return
+    if not member.bot:
+        embed = discord.Embed(title=f'Welcome on {guild.name}, {member}!',
+                              description='Welcome on this Server! Make sure to check out the rules!',
+                              color=0x22a7f0)
+        embed.set_thumbnail(url=member.avatar_url)
+        embed.set_footer(text=f'This welcome message was made by Ricci#4462!')
+        if guild:
+            channel = guild.get_channel(818807853430210560)
+            await channel.send(embed=embed)
+        try:
+            if not member.dm_channel:
+                await member.create_dm()
+            await member.dm_channel.send(embed=embed)
+        except discord.errors.Forbidden:
+            print('Es konnte keine Willkommensnachricht an {0} gesendet werden.'.format(member.name))
+        autoguild = autoroles.get(guild.id)
+        if autoguild and autoguild['memberroles']:
+            for roleId in autoguild['memberroles']:
+                role = guild.get_role(roleId)
+                if role:
+                    await member.add_roles(role, reason='AutoRoles', atomic=True)
+    else:
+        autoguild = autoroles.get(guild.id)
+        if autoguild and autoguild['botroles']:
+            for roleId in autoguild['botroles']:
+                role = guild.get_role(roleId)
+                if role:
+                    await member.add_roles(role, reason='AutoRoles', atomic=True)
+
+@client.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send('Please pass in all requirements :rolling_eyes:.')
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"{ctx.message.author.mention}, you don't have permissions to do this!")
+
+
+@client.command()
+#@commands.has_any_role([813339122869076019,813863874872344606,813863894212804720,813863818487660575,
+                         #813863844941266944]) #Owner, Admin, Moderator, Supporter, T-Supporter
+async def mute(ctx, member: discord.Member, time=None, *, reason = None):
+    guild = ctx.guild
+    muterole_id = check_muterole(guild.id)
+    print(muterole_id)
+    if str(muterole_id) == str("NoneR"):
+        error = await ctx.send("No muterole setup for this server!")
+        await asyncio.sleep(3)
+        await error.delete()
+        return
+    if str(muterole_id) == str("NoneG"):
+        error = await ctx.send("No muterole setup for this server!")
+        await asyncio.sleep(3)
+        await error.delete()
+        return
+    if str(member) == str(ctx.message.author):
+        cant = await ctx.send("You can't mute Yourself!")
+        await asyncio.sleep(3)
+        await ctx.message.delete()
+        await cant.delete()
+        return
+    autoguild = permissionroles.get(guild.id)
+    if autoguild and autoguild['muteroles']:
+        if not ctx.message.author.top_role.id in autoguild['muteroles']:
+            cant = await ctx.send('Du hast nicht genug Rechte!')
+            print("has no perm")
+            await asyncio.sleep(3)
+            await ctx.message.delete()
+            await cant.delete()
+            return
+    if ctx.message.author.top_role <= member.top_role:
+        print("has no perm")
+        cant = await ctx.send('Du kannst diese Person nicht muten!')
+        await asyncio.sleep(3)
+        await ctx.message.delete()
+        await cant.delete()
+        return
+    print("has perm")
+    if str(time) == "None":
+        reasons_embed = discord.Embed(title=f'Wähle einen Grund:',
+                              description='**[1]** Spamming \n '
+                                          '**[2]** NSFW  \n'
+                                          '**[3]** Werbung \n'
+                                          '**[4]** Beleidigung \n'
+                                          '**[5]** Schwere Beleidigung \n'
+                                          '**[6]** nerven \n'
+                                          '**[7]** Ständiges nerven \n'
+                                          '**[8]** perma \n'
+                                          '**[9]** Just For Fun \n'
+                                          '**[10]** Test',
+                              color=0x22a7f0)
+        reasons_embed.set_footer(text='To exit type: exit!')
+        ask = await ctx.send(embed=reasons_embed)
+        while str(time) == "None":
+            msg = await client.wait_for('message', check=lambda message: message.author == ctx.author)
+            answer = msg.content
+            if answer == "1":
+                await ask.delete()
+                await msg.delete()
+                reason = "Spamming!"
+                time='2h'
+            elif answer == "2":
+                await ask.delete()
+                await msg.delete()
+                reason = "NSFW!"
+                time='7d'
+            elif answer == "3":
+                await ask.delete()
+                await msg.delete()
+                reason = "Werbung!"
+                time='7d'
+            elif answer == "4":
+                await ask.delete()
+                await msg.delete()
+                reason = "Beleidigung!"
+                time='1h'
+            elif answer == "5":
+                await ask.delete()
+                await msg.delete()
+                reason = "Schwere Beleidigung!"
+                time='1d'
+            elif answer == "6":
+                await ask.delete()
+                await msg.delete()
+                reason = "nerven!"
+                time='1W'
+            elif answer == "7":
+                await ask.delete()
+                await msg.delete()
+                reason = "Ständiges nerven!"
+                time='1M'
+            elif answer == "8":
+                await ask.delete()
+                await msg.delete()
+                reason = "perma!"
+                time='perma'
+            elif answer == "9":
+                await ask.delete()
+                await msg.delete()
+                reason = "Just For Fun!"
+                time='1d'
+            elif answer == "10":
+                await ask.delete()
+                await msg.delete()
+                reason = "Test!"
+                time='30s'
+            elif answer == "exit":
+                exit = await ctx.channel.send('Exit!')
+                await asyncio.sleep(3)
+                await ctx.message.delete()
+                await ask.delete()
+                await msg.delete()
+                await exit.delete()
+                return
+            else:
+                invalid = await ctx.send("invalid")
+                reason = None
+    await ctx.message.delete()
+    memberrole = guild.get_role(814038818193014801)
+    #role_members = discord.utils.get(ctx.guild.roles, name='╚»『⛹️』Mitglied『⛹️』 «╝')
+    #role_muted = discord.utils.get(ctx.guild.roles, name='╚»『🔇 』Muted『🔇 』«╝')
+    #await member.remove_roles(memberrole)
+    muterole = guild.get_role(muterole_id)
+    await member.add_roles(muterole)
+    embed = discord.Embed(title="User Muted!",
+                          description="**{0}** was muted by **{1}**!".format(member, ctx.message.author),
+                          color=0xff00f6)
+    embed.add_field(name='Time', value=time)
+    embed.add_field(name='Reason', value=reason, inline=True)
+    try:
+        if not member.dm_channel:
+            await member.create_dm()
+        await member.dm_channel.send(embed=embed)
+    except discord.errors.Forbidden:
+        print('Es konnte keine DM an {0} gesendet werden.'.format(member.name))
+    await ctx.send(embed=embed)
+    #await modlog.send(embed=embed)
+    time_convert = {"s": 1, "m": 60, "h": 3600, "d": 86400, "W": 25200, "M": 2592000, "J": 31104000}
+    tempmute = int(time[0]) * time_convert[time[-1]]
+    mutetime(member.id, tempmute, guild, reason)
+    #await modlog.send(embed=embed)
+
+@client.command()
+#@commands.has_any_role([813339122869076019, 813863874872344606, 813863894212804720, #Owner, Admin, Moderator,
+                        #813863818487660575]) #Supporter
+async def unmute(ctx, member: discord.Member, *, reason = None):
+    guild = ctx.guild
+    muterole_id = check_muterole(guild.id)
+    print(muterole_id)
+    if str(muterole_id) == str("NoneR"):
+        error = await ctx.send("No muterole setup for this server!")
+        await asyncio.sleep(3)
+        error.delete()
+        return
+    if str(muterole_id) == str("NoneG"):
+        error = await ctx.send("No muterole setup for this server!")
+        await asyncio.sleep(3)
+        error.delete()
+        return
+    muterole = guild.get_role(muterole_id)
+    autoguild = permissionroles.get(guild.id)
+    if autoguild and autoguild['unmuteroles']:
+        if not ctx.message.author.top_role.id in autoguild['unmuteroles']:
+            print("has no perm")
+            cant = await ctx.send('Du hast keine Rechte dafür!')
+            await asyncio.sleep(3)
+            await ctx.message.delete()
+            await cant.delete()
+            return
+    if ctx.message.author.top_role <= member.top_role:
+        print("has no perm")
+        cant = await ctx.send('Du kannst diese Person nicht muten!')
+        await asyncio.sleep(3)
+        await ctx.message.delete()
+        await cant.delete()
+        return
+
+    print("has perm")
+
+    await ctx.message.delete()
+    #role_members = discord.utils.get(ctx.guild.roles, name='Members')
+    #role_muted = discord.utils.get(ctx.guild.roles, name='Muted')
+    await member.remove_roles(muterole)
+    #await member.add_roles(memberrole)
+    mutetime(member.id, 0, guild, reason)
+    embed = discord.Embed(title="User UnMuted!",
+                          description="**{0}** was unmuted by **{1}**!".format(member, ctx.message.author),
+                          color=0xff00f6)
+    embed.add_field(name='Reason', value=reason)
+    try:
+        if not member.dm_channel:
+            await member.create_dm()
+        await member.dm_channel.send(embed=embed)
+    except discord.errors.Forbidden:
+        print('Es konnte keine DM an {0} gesendet werden.'.format(member.name))
+    await ctx.send(embed=embed)
+    #await modlog.send(embed=embed)
+
+@client.command()
+@commands.has_permissions(ban_members = True)
+async def ban(ctx, member : discord.Member, time=None, *, reason = None):
+    if str(member) == str(ctx.message.author):
+        cant = await ctx.send("You can't ban Yourself!")
+        await asyncio.sleep(3)
+        await ctx.message.delete()
+        await cant.delete()
+        return
+    if str(time) == "None":
+        reasons_embed = discord.Embed(title=f'Wähle einen Grund:',
+                              description='**[1]** Spamming \n '
+                                          '**[2]** Belästigung  \n'
+                                          '**[3]** Hacking \n'
+                                          '**[4]** Werbung \n'
+                                          '**[5]** NSFW \n'
+                                          '**[6]** Bug using \n'
+                                          '**[7]** Beleidigung \n'
+                                          '**[8]** Schwere Beleidigung \n'
+                                          '**[9]** nerven \n'
+                                          '**[10]** Ständiges nerven'
+                                          '**[11]** Nutzloser Bot \n'
+                                          '**[12]** Just For Fun \n'
+                                          '**[13]** Test \n'
+                                          '**[14]** perma',
+                              color=0x22a7f0)
+        reasons_embed.set_footer(text='To exit type: exit!')
+        ask = await ctx.send(embed=reasons_embed)
+        while str(time) == "None":
+            msg = await client.wait_for('message', check=lambda message: message.author == ctx.author)
+            answer = msg.content
+            if answer == "1":
+                await ask.delete()
+                await msg.delete()
+                reason = "Spamming!"
+                time = '1W'
+            elif answer == "2":
+                await ask.delete()
+                await msg.delete()
+                reason = "Belästigung!"
+                time = '2W'
+            elif answer == "3":
+                await ask.delete()
+                await msg.delete()
+                reason = "Hacking!"
+                time = '2J'
+            elif answer == "4":
+                await ask.delete()
+                await msg.delete()
+                reason = "Werbung!"
+                time = '1M'
+            elif answer == "5":
+                await ask.delete()
+                await msg.delete()
+                reason = "NSFW!"
+                time = '1M'
+            elif answer == "6":
+                await ask.delete()
+                await msg.delete()
+                reason = "Bug using!"
+                time = '1W'
+            elif answer == "7":
+                await ask.delete()
+                await msg.delete()
+                reason = "Beleidigung!"
+                time = '1W'
+            elif answer == "8":
+                await ask.delete()
+                await msg.delete()
+                reason = "Schwere Beleidigung!"
+                time = '1M'
+            elif answer == "9":
+                await ask.delete()
+                await msg.delete()
+                reason = "nerven!"
+                time = '3d'
+            elif answer == "10":
+                await ask.delete()
+                await msg.delete()
+                reason = "Ständiges nerver!"
+                time = '1W'
+            elif answer == "11":
+                await ask.delete()
+                await msg.delete()
+                reason = "Nutzloser Bot!"
+                time = '1m'
+            elif answer == "12":
+                await ask.delete()
+                await msg.delete()
+                reason = "Just For Fun!"
+                time = '1d'
+            elif answer == "13":
+                await ask.delete()
+                await msg.delete()
+                reason = "Test!"
+                time = '1m'
+            elif answer == "14":
+                await ask.delete()
+                await msg.delete()
+                reason = "perma!"
+                time = 'perma'
+            elif answer == "exit":
+                exit = await ctx.channel.send('Exit!')
+                await asyncio.sleep(3)
+                await ctx.message.delete()
+                await ask.delete()
+                await msg.delete()
+                await exit.delete()
+                return
+            else:
+                invalid = await ctx.send("invalid")
+                reason = None
+    await ctx.message.delete()
+    embed = discord.Embed(title="User Banned!",
+                          description="**{0}** was banned by **{1}**!".format(member, ctx.message.author),
+                          color=0xff00f6)
+    embed.add_field(name='Reason', value=reason)
+    try:
+        if not member.dm_channel:
+            await member.create_dm()
+        await member.dm_channel.send(embed=embed)
+    except discord.errors.Forbidden:
+        print('Es konnte keine DM an {0} gesendet werden.'.format(member.name))
+    await ctx.send(embed=embed)
+    print(member)
+    time_convert = {"s": 1, "m": 60, "h": 3600, "d": 86400, "W": 25200, "M": 2592000, "J": 31104000}
+    tempban = int(time[0]) * time_convert[time[-1]]
+    guild = ctx.guild
+    bantime(member.id, tempban, guild, reason)
+    await member.ban(reason = reason)
+
+@client.command()
+@commands.has_permissions(kick_members = True)
+async def kick(ctx, member : discord.Member, *, reason = None):
+    if str(member) == str(ctx.message.author):
+        cant = await ctx.send("You can't kick Yourself!")
+        await asyncio.sleep(3)
+        await ctx.message.delete()
+        await cant.delete()
+        return
+    if str(reason) == "None":
+        reasons_embed = discord.Embed(title=f'Wähle einen Grund:',
+                              description='**[1]** Spamming \n '
+                                          '**[2]** NSFW  \n'
+                                          '**[3]** Werbung \n'
+                                          '**[4]** Beleidigung \n'
+                                          '**[5]** Schwere Beleidigung \n'
+                                          '**[6]** Ständiges nerven \n'
+                                          '**[7]** nerven \n'
+                                          '**[8]** Just For Fun',
+                              color=0x22a7f0)
+        reasons_embed.set_footer(text='To exit type: exit!')
+        ask = await ctx.send(embed=reasons_embed)
+        while str(reason) == "None":
+            msg = await client.wait_for('message', check=lambda message: message.author == ctx.author)
+            answer = msg.content
+            if answer == "1":
+                await ask.delete()
+                await msg.delete()
+                reason = "Spamming!"
+            elif answer == "exit":
+                exit = await ctx.channel.send('Exit!')
+                await asyncio.sleep(3)
+                await ctx.message.delete()
+                await ask.delete()
+                await msg.delete()
+                await exit.delete()
+                return
+            else:
+                invalid = await ctx.send("invalid")
+                reason = None
+    await ctx.message.delete()
+    embed = discord.Embed(title="User Kicked!",
+                          description="**{0}** was kicket by **{1}**!".format(member, ctx.message.author),
+                          color=0xff00f6)
+    embed.add_field(name='Reason', value=reason)
+    try:
+        if not member.dm_channel:
+            await member.create_dm()
+        await member.dm_channel.send(embed=embed)
+    except discord.errors.Forbidden:
+        print('Es konnte keine DM an {0} gesendet werden.'.format(member.name))
+    await ctx.send(embed=embed)
+    print(member)
+    await member.kick(reason = reason)
+    #await modlog.send(embed=embed)
+
+@client.command()
+@commands.has_permissions(administrator = True)
+async def unban(ctx, member):
+    print("test1")
+    banned_users = await ctx.guild.bans()
+    print("test2")
+    for ban_entry in banned_users:
+        print("test3")
+        user = ban_entry.user
+        print("test4")
+        print(user)
+        print("test5")
+        print(member)
+        if str(member) == str(user):
+            print("succes")
+            await ctx.guild.unban(user)
+            await ctx.message.delete()
+            embed = discord.Embed(title="User UnBanned!",
+                                    description="**{0}** was unbanned by **{1}**!".format(member, ctx.message.author),
+                                    color=0xff00f6)
+            try:
+                if not member.dm_channel:
+                    await member.create_dm()
+                await member.dm_channel.send(embed=embed)
+            except discord.errors.Forbidden:
+                print('Es konnte keine DM an {0} gesendet werden.'.format(member.name))
+            await ctx.send(embed=embed)
+        else:
+            print("fail")
+
+@client.command()
+async def userinfo(ctx, member: discord.Member):
+    if member:
+        embed = discord.Embed(title='Userinfo for {}'.format(member.name),
+                              description='This is a userinfo for the user {}'.format(member.mention),
+                              color=0x22a7f0)
+        embed.add_field(name='Server joined at: ', value=member.joined_at.strftime('%d/%m/%Y, %H:%M:%S'),
+                        inline=True)
+        embed.add_field(name='Discord joined at: ', value=member.created_at.strftime('%d/%m/%Y, %H:%M:%S'),
+                        inline=True)
+        rollen = ''
+        for role in member.roles:
+            if not role.is_default():
+                rollen += '{} \r\n'.format(role.mention)
+        if rollen:
+            embed.add_field(name='Roles', value=rollen, inline=True)
+        embed.set_thumbnail(url=member.avatar_url)
+        embed.set_footer(text=f'Userinfo requestet by {ctx.message.author}.')
+        await ctx.message.delete()
+        mess = await ctx.channel.send(embed=embed)
+        #await modlog.send(embed=embed)
+
+@client.command()
+@commands.has_permissions(manage_messages = True)
+async def clear(ctx):
+    args = ctx.message.content.split(' ')
+    if len(args) == 2:
+        if args[1].isdigit():
+            count = int(args[1]) + 1
+            deleted = await ctx.channel.purge(limit=count, check=is_not_pinned)
+            answer = await ctx.channel.send(''
+                                            '{} Messages deleted.\n'
+                                            ''.format(len(deleted) - 1))
+            await asyncio.sleep(3)
+            await answer.delete()
+            #await modlog.send(f"Clear command used by {ctx.message.author}!")
+    elif len(args) == 1:
+        await ctx.channel.purge()
+        answer = await ctx.channel.send('```Channel cleared!```')
+        await asyncio.sleep(3)
+        await answer.delete()
+
+@client.command()
+async def help(ctx):
+    await ctx.message.delete()
+    embed = discord.Embed(title=f'Help:', description=f'**{prefix}ban**         ban a player!             \n'
+                                                      f'**{prefix}unban**       unban a player!           \n'
+                                                      f'**{prefix}mute**        mute a player!            \n'
+                                                      f'**{prefix}unmute**      unmute a player!          \n'
+                                                      f'**{prefix}kick**        kick a player!            \n'
+                                                      f'**{prefix}help**        shows help!               \n'
+                                                      f'**{prefix}userinfo**    shows a userinfo!         \n'
+                                                      f'**{prefix}clear**       clears some messages!', color=0x2ecc71)
+    embed.set_footer(text=f'If you have ideas for the Bot or if you want to report bugs ask Ricci#4462!')
+    await ctx.channel.send(embed=embed)
+
+@client.command()
+async def roleguide(ctx):
+    if str(ctx.guild.id) == "816634292372373524":
+        owner_role = ctx.guild.get_role(818604747249811476)
+        admin_role = ctx.guild.get_role(818603952580460564)
+        mod_role = ctx.guild.get_role(818604918109241415)
+        supp_role = ctx.guild.get_role(818606336136577045)
+        tsupp_role = ctx.guild.get_role(818606459742322718)
+        staff_role = ctx.guild.get_role(818608077821444096)
+
+        youtuber_role = ctx.guild.get_role(818607876053663816)
+        serverbooster_role = ctx.guild.get_role(818636152009523250)
+        friends_role = ctx.guild.get_role(818608075191091251)
+        premium_role = ctx.guild.get_role(818607209872228394)
+        member_role = ctx.guild.get_role(818606628307075142)
+        
+        LAC07Bot_role = ctx.guild.get_role(818899535601467462)
+        Bots_role = ctx.guild.get_role(818757502472159233)
+
+        muted_role = ctx.guild.get_role(818551265545158783)
+
+        ricci_role = ctx.guild.get_role(818542606039777352)
+        if owner_role in ctx.message.author.roles or ricci_role in ctx.message.author.roles:
+            await ctx.message.delete()
+            embed = discord.Embed(title=f'Role Guide:', description='', color=0x2ecc71)
+            embed.add_field(name="Staff Roles", value=f"{owner_role.mention}: This role is only for the Owner! \n"
+                                                      f"{admin_role.mention}: This role you can get after enough trust! \n"
+                                                      f"{mod_role.mention}: This role you can get after enough trust! \n"
+                                                      f"{supp_role.mention}: This role you can after the test time as T-Supporter! \n"
+                                                      f"{tsupp_role.mention}: This role is for new staff members in the test time! \n"
+                                                      f"{staff_role.mention}: This role is for the staff members!", inline=False)
+
+            embed.add_field(name="Other Roles", value=f"{youtuber_role.mention}: This is for Youtubers with 250+ subscribers! \n"
+                                                      f"{serverbooster_role.mention}: This role is for server booster! \n"
+                                                      f"{friends_role.mention}: This role is for friends! \n"
+                                                      f"{premium_role.mention}: This role can do nothing at the moment! \n"
+                                                      f"{member_role.mention}: This role is the role for all verified members! \n"
+                                                      f"{LAC07Bot_role.mention}: This role is for the LAC07 Bot! \n"
+                                                      f"{Bots_role.mention}: This role is for the Bots! \n"
+                                                      f"{muted_role.mention}: This role is for muted users! ", inline=False)
+
+            LAC07 = ctx.guild.get_role(818753671851409429)
+            MEE6 = ctx.guild.get_role(818524567458938981)
+            carl = ctx.guild.get_role(818521416407973948)
+            censor = ctx.guild.get_role(818543560483536967)
+            yagpd = ctx.guild.get_role(818548353813053533)
+
+            dyno = ctx.guild.get_role(818458115967025174)
+            Groovy = ctx.guild.get_role(818543867146010625)
+            Rythm = ctx.guild.get_role(818544073270100070)
+            Statsify = ctx.guild.get_role(818553888486850571)
+
+            embed.add_field(name="Bot Roles",
+                            value=f"{LAC07.mention}: This role is for the LAC07 Bot! \n"
+                                  f"{MEE6.mention}: This role is for the MEE6 Bot! \n"
+                                  f"{carl.mention}: This role is for the Carl-Bot! \n"
+                                  f"{censor.mention}: This role is for the Censor Bot! \n"
+                                  f"{yagpd.mention}: This role is for the YAGPD Bot! \n"
+                                  f"{dyno.mention}: This role is for the Dyno Bot! \n"
+                                  f"{Groovy.mention}: This role is for the Groovy Bot! \n"
+                                  f"{Rythm.mention}: This role is for the Rythm Bot! \n"
+                                  f"{Statsify.mention}: This role is for the Statsify Bot! \n", inline=False)
+
+            embed.set_footer(text=f'This is the roleguid of {ctx.guild.name}, by Ricci#4462!')
+            role_guide_ch = ctx.guild.get_channel(818637178313506886)
+            ctx.message.delete()
+            await role_guide_ch.purge()
+            await role_guide_ch.send(embed=embed)
+
+@client.command()
+async def channelportal(ctx):
+    if str(ctx.guild.id) == "816634292372373524":
+        owner_role = ctx.guild.get_role(818604747249811476)
+        ricci_role = ctx.guild.get_role(818542606039777352)
+        if owner_role in ctx.message.author.roles or ricci_role in ctx.message.author.roles:
+            channel_portal_ch = ctx.guild.get_channel(818609074635276329)
+            embed = discord.Embed(title=f'Role Guide:', description='', color=0x2ecc71)
+            guild = client.get_guild(816634292372373524)
+
+            rules_channel = guild.get_channel(818608854421078038)
+            general_channel = guild.get_channel(818620765280665650)
+            mates_channel = guild.get_channel(816634930477924362)
+            images_channel = guild.get_channel(818528283247378492)
+            imagesreact_channel = guild.get_channel(818544874663837746)
+            videos_channel = guild.get_channel(818530025753149440)
+            bothelp_channel = guild.get_channel(818606725585436682)
+            botcmds_channel = guild.get_channel(818606796050530344)
+            stats_channel = guild.get_channel(818605660681404416)
+            birthday_channel = guild.get_channel(818536107196153907)
+
+            embed.add_field(name="Channel Portal",
+                            value=f"{rules_channel.mention}: Before getting startet make sure to check out the rules! \n"
+                                  f"{general_channel.mention}: If you want to chat make sure to check out the general channel! \n"
+                                  f"{mates_channel.mention}: If you want to find mates for a game ask in this channel and maybe u find someone! \n"
+                                  f"{images_channel.mention}: If you want to post images then go to this channel! \n"
+                                  f"{imagesreact_channel.mention}: To ract to images check out this channel! \n"
+                                  f"{videos_channel.mention}: To post videos go to this channel! \n"
+                                  f"{bothelp_channel.mention}: If you don't know the bot prefixes go to this channel! \n"
+                                  f"{botcmds_channel.mention}: To use Bot Commands go to this channel! \n"
+                                  f"{stats_channel.mention}: To see the Hypixel stats of someone go to this channel! \n"
+                                  f"{birthday_channel.mention}: In this channels are the birthdays shown! You can set yours with **!birthday**!", inline=False)
+            embed.set_footer(text='This is the Channel Portal by Ricci#4462!')
+            await channel_portal_ch.purge()
+            await channel_portal_ch.send(embed=embed)
+
+@client.command()
+async def bothelp(ctx):
+    if str(ctx.guild.id) == "816634292372373524":
+        owner_role = ctx.guild.get_role(818604747249811476)
+        ricci_role = ctx.guild.get_role(818542606039777352)
+        if owner_role in ctx.message.author.roles or ricci_role in ctx.message.author.roles:
+            embed = discord.Embed(title=f'', description='', color=0x2ecc71)
+            embed.add_field(name="Bot Prefix",
+                            value=f'LAC07: **{prefix}** \n'
+                                  'Rythm: **.** \n'
+                                  'Groovy: **%** \n'
+                                  'Mee6: **!** \n'
+                                  'Yagpdb: **-** \n'
+                                  'statisfy: **s!p (mode) (name)** / **s!d (name)** \n'
+                                  'carl-bot: **_** \n'
+                                  'Censor Bot: **+** \n'
+                                  'Dyno: **?**')
+            embed.set_footer(text='This are all Bot prefix by Ricci#4462!')
+            guild = client.get_guild(816634292372373524)
+            bothelp_channel = guild.get_channel(818606725585436682)
+            await ctx.message.delete()
+            await bothelp_channel.purge()
+            await bothelp_channel.send(embed=embed)
+
+@client.command()
+async def rules(ctx):
+    if str(ctx.guild.id) == "816634292372373524":
+        owner_role = ctx.guild.get_role(818604747249811476)
+        ricci_role = ctx.guild.get_role(818542606039777352)
+        if owner_role in ctx.message.author.roles or ricci_role in ctx.message.author.roles:
+            embed = discord.Embed(title='Rules', description='**More Rules are coming soon!**', color=0x2ecc71)
+            embed.add_field(name="§1: Text Channels",
+                            value=f'**§1.1**: Don\'t use bad words! \n'
+                                  f'**§1.2**: Don\'t insult anyone! \n'
+                                  f'**§1.3**: No racist or NSFW stuff! \n'
+                                  f'**§1.4**: Keep chat clear and use the channels for what they are made for! \n'
+                                  f'**§1.5**: Don\'t spam! \n'
+                                  f'**§1.6**: Pinging only for a reason!')
+            embed.add_field(name="§2: Voice Channels",
+                            value=f'**§2.1**: Don\'t use bad words! \n'
+                                  f'**§2.2**: No racist or NSFW stuff! \n'
+                                  f'**§2.3**: Don\'t ubuse ur microphone! \n'
+                                  f'**§2.4**: You can only record in a voice channel if all members in the channel allows it! \n'
+                                  f'**§2.5**: Don\' make loud sounds!', inline=False)
+            #emed.
+            embed.set_footer(text='This are the rules made by Ricci#4462!')
+            guild = client.get_guild(816634292372373524)
+            rules_channel = guild.get_channel(818608854421078038)
+            await ctx.message.delete()
+            await rules_channel.purge()
+            mess = await rules_channel.send(embed=embed)
+            await mess.add_reaction('✅')
+             
+@client.command()
+async def s_updates(ctx, *, update=None):
+    await ctx.message.delete()
+    if str(update) == "None":
+        error = await ctx.channel.send('Du musst angeben was du da reinschreiben möchtest!')
+        await asyncio.sleep(3)
+        error.delete()
+        return
+    owner_role = ctx.guild.get_role(818604747249811476)
+    ricci_role = ctx.guild.get_role(818542606039777352)
+    if owner_role in ctx.message.author.roles or ricci_role in ctx.message.author.roles:
+        s_update_ch = ctx.guild.get_channel(818852811348508682)
+        embed = discord.Embed(title='Server Updates!', description='', color=0x2ecc71)
+        embed.add_field(name="Updates:", value=str(update))
+        embed.set_footer(text=f'This update was sent by {ctx.message.author}!')
+        anouncement = await s_update_ch.send(embed=embed)
+        await anouncement.publish()
+
+@client.command()
+async def karma(ctx, member: discord.Member, count):
+    with open('karma.json', 'r') as f:
+        karmadata = json.load(f)
+
+    if karmadata[f'{member.id}']:
+        leftkarma = karmadata[f'{member.id}']['karma']
+    else:
+        karmadata[f'{member.id}'] = {}
+        karmadata[f'{member.id}']['karma'] = 100
+        ctx.channel.send(karmadata)
+
+        with open('karma.json', 'w') as f:
+            json.dump(karmadata, f)
+
+@client.command()
+async def showkarma(ctx):
+    with open('karma.json', 'r') as f:
+        karmadata = json.load(f)
+    ctx.channel.send(karmadata)
+
+client.run(os.environ['token'])
